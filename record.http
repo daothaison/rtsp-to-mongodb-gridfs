@@ -1,0 +1,6 @@
+POST http://localhost:8080/start-recording
+Content-Type: application/json
+
+{
+  "rtsp_url": "rtsp://localhost:8554/live"
+}
