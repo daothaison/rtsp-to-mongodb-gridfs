@@ -133,7 +133,7 @@ func watchM3u8File(ctx context.Context, recordingInfo *RecordingInfo) {
 
 		oldAllSegments = playlist.(*m3u8.MediaPlaylist).GetAllSegments()
 
-		time.Sleep(15 * time.Second)
+		time.Sleep(10 * time.Second)
 	}
 }
 
