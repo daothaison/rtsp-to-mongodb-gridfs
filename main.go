@@ -3,23 +3,28 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/gin-gonic/gin"
+	"github.com/grafov/m3u8"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/gridfs"
+	"go.mongodb.org/mongo-driver/mongo/options"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"sync"
-
-	"github.com/gin-gonic/gin"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"time"
 )
 
 var streamMutex sync.Mutex
 var client *mongo.Client
 var db *mongo.Database
+
+// create a map to store stream id and context cancel
+var streamContextMap = make(map[string]context.CancelFunc)
 
 type RecordingInfo struct {
 	Id           string `json:"_id" bson:"_id"`
@@ -29,18 +34,14 @@ type RecordingInfo struct {
 }
 
 func startRecording(recordingInfo *RecordingInfo) {
-	fs, err := gridfs.NewBucket(
-		db,
-	)
-	if err != nil {
-		log.Printf("Error creating GridFS bucket: %s \n", err)
-		return
-	}
-
 	log.Printf("Recording stream url %s & stream id %s\n", recordingInfo.RTSPURL, recordingInfo.Id)
 
+	// create context with cancel
+	ctx, cancel := context.WithCancel(context.Background())
+	streamContextMap[recordingInfo.Id] = cancel
+
 	_ = exec.Command("mkdir", "-p", fmt.Sprintf("temp/%s", recordingInfo.Id)).Start()
-	cmd := exec.Command(
+	cmd := exec.CommandContext(ctx,
 		"ffmpeg",
 		"-i",
 		recordingInfo.RTSPURL,
@@ -50,30 +51,127 @@ func startRecording(recordingInfo *RecordingInfo) {
 		"copy",
 		"-hls_time",
 		"10",
+		"-hls_list_size",
+		"0",
 		fmt.Sprintf("temp/%s/output.m3u8", recordingInfo.Id))
-	err = cmd.Start()
+	err := cmd.Start()
 	if err != nil {
 		log.Printf("Error converting to HLS: %s\n", err)
 		return
 	}
 
-	err = cmd.Wait()
+	// goroutine wait for context cancel
+	watchContext, cancel := context.WithCancel(context.Background())
+	go func() {
+		err = cmd.Wait()
+		<-ctx.Done()
+		log.Printf("Stream %s is stopped by context cancel\n", recordingInfo.Id)
+		cancel()
+		err := cmd.Process.Kill()
+		if err != nil {
+			return
+		}
+	}()
+
+	log.Printf("Waiting for ffmpeg command to finish & recording...")
+	time.Sleep(15 * time.Second)
+	watchM3u8File(watchContext, recordingInfo)
+}
+
+func watchM3u8File(ctx context.Context, recordingInfo *RecordingInfo) {
+	var oldAllSegments []*m3u8.MediaSegment
+	tempPath := fmt.Sprintf("temp/%s", recordingInfo.Id)
+	filePath := fmt.Sprintf("%s/output.m3u8", tempPath)
+
+	for {
+		file, err := os.OpenFile(filePath, os.O_APPEND|os.O_RDWR, os.ModeAppend)
+		if err != nil {
+			log.Printf("Error when open %s: %s\n", filePath, err.Error())
+			return
+		}
+		defer file.Close()
+
+		playlist, listType, err := m3u8.DecodeFrom(io.Reader(file), true)
+		if err != nil {
+			log.Printf("Error when m3u8 decode %s: %s\n", filePath, err.Error())
+			return
+		}
+
+		if listType == m3u8.MEDIA {
+			mediaPlaylist := playlist.(*m3u8.MediaPlaylist)
+
+			log.Printf("Media Playlist with %d segments\n", mediaPlaylist.Count())
+
+			currentAllSegments := mediaPlaylist.GetAllSegments()
+			if len(currentAllSegments) > 0 {
+				storeIntoGridFS(recordingInfo, "output.m3u8")
+			}
+
+			if len(currentAllSegments) > len(oldAllSegments) {
+				for i := uint(len(oldAllSegments)); i < mediaPlaylist.Count(); i++ {
+					segment := mediaPlaylist.Segments[i]
+					log.Printf("New Segment %d: %s\n", i, segment.URI)
+					storeIntoGridFS(recordingInfo, segment.URI)
+				}
+			}
+
+			log.Printf("Media Playlist closed: %v\n", mediaPlaylist.Closed)
+			if mediaPlaylist.Closed {
+				break
+			}
+		}
+
+		if ctx.Err() == context.Canceled {
+			log.Printf("Context done, stop recording stream id %s & append end character to %s\n", recordingInfo.Id, filePath)
+			_, err := file.WriteString("#EXT-X-ENDLIST\n")
+			if err != nil {
+				log.Printf("Error appending end character to %s: %s\n", filePath, err.Error())
+			}
+
+			break
+		}
+
+		oldAllSegments = playlist.(*m3u8.MediaPlaylist).GetAllSegments()
+
+		time.Sleep(15 * time.Second)
+	}
+}
+
+func storeIntoGridFS(recordingInfo *RecordingInfo, segmentUri string) {
+	log.Printf("Storing segment %s into GridFS\n", segmentUri)
+	segmentPath := fmt.Sprintf("temp/%s/%s", recordingInfo.Id, segmentUri)
+
+	fs, err := gridfs.NewBucket(
+		db,
+	)
 	if err != nil {
-		log.Printf("Error during conversion: %s\n", err)
+		log.Printf("Error creating GridFS bucket: %s \n", err)
 		return
+	}
+
+	fileId := findGridFsFile(recordingInfo, segmentUri)
+	if fileId != "" {
+		log.Printf("Drop exist segment %s in GridFS\n", segmentUri)
+		id, _ := primitive.ObjectIDFromHex(fileId)
+		if err := fs.Delete(id); err != nil {
+			log.Printf("Drop exist segment %s in GridFS error: %s\n", segmentUri, err.Error())
+		}
 	}
 
 	streamMutex.Lock()
 	defer streamMutex.Unlock()
 	if recordingInfo.IsRecording {
-		file, err := os.Open(fmt.Sprintf("temp/%s/output.m3u8", recordingInfo.Id))
+		file, err := os.Open(segmentPath)
 		if err != nil {
 			log.Printf("Error opening HLS file: %s\n", err)
 			return
 		}
 		defer file.Close()
 
-		uploadStream, err := fs.OpenUploadStream(fmt.Sprintf("recorded_video_%s.m3u8", recordingInfo.Id))
+		log.Printf("Uploading file %s to GridFS\n", segmentUri)
+
+		uploadOpts := options.GridFSUpload().SetMetadata(bson.D{{"stream_id", recordingInfo.Id}})
+		uploadStream, err := fs.OpenUploadStream(segmentUri, uploadOpts)
 		if err != nil {
 			log.Printf("Error creating GridFS upload stream: %s\n", err)
 			return
@@ -92,20 +190,23 @@ func startRecording(recordingInfo *RecordingInfo) {
 		}
 
 		fmt.Printf("File uploaded to GridFS for stream ID: %s, file id: %s \n", recordingInfo.Id, uploadStream.FileID)
-
-		// Update the information in MongoDB to store the GridFS file ID
-		filter := bson.D{{"rtsp_url", recordingInfo.RTSPURL}}
-		update := bson.D{
-			{"$set", bson.D{
-				{"output_file_id", uploadStream.FileID},
-				{"is_recording", false},
-			}},
-		}
-		_, err = db.Collection("recordings").UpdateOne(context.Background(), filter, update)
-		if err != nil {
-			log.Printf("Error updating MongoDB document: %s\n", err)
-		}
 	}
+}
+
+func findGridFsFile(recordingInfo *RecordingInfo, segmentUri string) string {
+	type gridfsFile struct {
+		Id string `bson:"_id"`
+	}
+	var file gridfsFile
+
+	// find one record in mongo with filter
+	filter := bson.D{{"filename", segmentUri}, {"metadata", bson.D{{"stream_id", recordingInfo.Id}}}}
+	err := db.Collection("fs.files").FindOne(context.Background(), filter).Decode(&file)
+	if err != nil {
+		return ""
+	}
+
+	return file.Id
 }
 
 func main() {
@@ -134,7 +235,7 @@ func main() {
 			return
 		}
 
-		log.Printf("recording stream url %s\n", recordingInfo.RTSPURL)
+		log.Printf("Recording stream url %s\n", recordingInfo.RTSPURL)
 		rtspURL := recordingInfo.RTSPURL
 
 		streamMutex.Lock()
@@ -163,20 +264,23 @@ func main() {
 
 			go startRecording(&recordingInfo)
 		} else {
-			recordingInfo.IsRecording = true
-			update := bson.D{
-				{"$set", bson.D{
-					{"is_recording", true},
-				}},
-			}
-			_, err := db.Collection("recordings").UpdateOne(context.Background(), bson.D{{"rtsp_url", rtspURL}}, update)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"message": "Error updating recording info"})
-				return
+			if recordingInfo.IsRecording == false {
+				recordingInfo.IsRecording = true
+				update := bson.D{
+					{"$set", bson.D{
+						{"is_recording", true},
+					}},
+				}
+				_, err := db.Collection("recordings").UpdateOne(context.Background(), bson.D{{"rtsp_url", rtspURL}}, update)
+				if err != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"message": "Error updating recording info"})
+					return
+				}
+				go startRecording(&recordingInfo)
 			}
 		}
 
-		c.JSON(http.StatusOK, gin.H{"message": "Recording started for Rtsp URL: " + rtspURL})
+		c.JSON(http.StatusOK, gin.H{"message": "Recording started for rtsp URL: " + rtspURL})
 	})
 
 	r.POST("/stop-recording", func(c *gin.Context) {
@@ -197,7 +301,6 @@ func main() {
 		if err != nil {
 			c.JSON(http.StatusOK, gin.H{"message": "No recording in progress for rtsp url: " + rtspURL})
 			return
-			// Stream not found, meaning no recording is in progress
 		}
 
 		recordingInfo.IsRecording = false
@@ -211,6 +314,9 @@ func main() {
 			c.JSON(http.StatusInternalServerError, gin.H{"message": "Error updating recording info"})
 			return
 		}
+
+		// cancel context
+		streamContextMap[recordingInfo.Id]()
 
 		c.JSON(http.StatusOK, gin.H{"message": "Recording stopped for rtsp url: " + rtspURL})
 	})
