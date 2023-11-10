@@ -76,6 +76,9 @@ func startRecording(recordingInfo *RecordingInfo) {
 	log.Printf("Waiting for ffmpeg command to finish & recording...")
 	time.Sleep(15 * time.Second)
 	watchM3u8File(watchContext, recordingInfo)
+
+	// remove temp folder
+	// _ = exec.Command("rm", "-rf", fmt.Sprintf("temp/%s", recordingInfo.Id)).Start()
 }
 
 func watchM3u8File(ctx context.Context, recordingInfo *RecordingInfo) {
