@@ -40,7 +40,6 @@ func startRecording(recordingInfo *RecordingInfo) {
 	ctx, cancel := context.WithCancel(context.Background())
 	streamContextMap[recordingInfo.Id] = cancel
 
-	_ = exec.Command("mkdir", "-p", fmt.Sprintf("temp/%s", recordingInfo.Id)).Start()
 	cmd := exec.CommandContext(ctx,
 		"ffmpeg",
 		"-i",
@@ -53,7 +52,7 @@ func startRecording(recordingInfo *RecordingInfo) {
 		"10",
 		"-hls_list_size",
 		"0",
-		fmt.Sprintf("temp/%s/output.m3u8", recordingInfo.Id))
+		fmt.Sprintf("%s_output.m3u8", recordingInfo.Id))
 	err := cmd.Start()
 	if err != nil {
 		log.Printf("Error converting to HLS: %s\n", err)
@@ -76,15 +75,11 @@ func startRecording(recordingInfo *RecordingInfo) {
 	log.Printf("Waiting for ffmpeg command to finish & recording...")
 	time.Sleep(15 * time.Second)
 	watchM3u8File(watchContext, recordingInfo)
-
-	// remove temp folder
-	// _ = exec.Command("rm", "-rf", fmt.Sprintf("temp/%s", recordingInfo.Id)).Start()
 }
 
 func watchM3u8File(ctx context.Context, recordingInfo *RecordingInfo) {
 	var oldAllSegments []*m3u8.MediaSegment
-	tempPath := fmt.Sprintf("temp/%s", recordingInfo.Id)
-	filePath := fmt.Sprintf("%s/output.m3u8", tempPath)
+	filePath := fmt.Sprintf("%s_output.m3u8", recordingInfo.Id)
 
 	for {
 		file, err := os.OpenFile(filePath, os.O_APPEND|os.O_RDWR, os.ModeAppend)
@@ -107,7 +102,9 @@ func watchM3u8File(ctx context.Context, recordingInfo *RecordingInfo) {
 
 			currentAllSegments := mediaPlaylist.GetAllSegments()
 			if len(currentAllSegments) > 0 {
-				storeIntoGridFS(recordingInfo, "output.m3u8")
+				storeIntoGridFS(recordingInfo, filePath)
+				// remove m3u8 file
+				//_ = exec.Command("rm", "-rf", filePath).Start()
 			}
 
 			if len(currentAllSegments) > len(oldAllSegments) {
@@ -115,6 +112,8 @@ func watchM3u8File(ctx context.Context, recordingInfo *RecordingInfo) {
 					segment := mediaPlaylist.Segments[i]
 					log.Printf("New Segment %d: %s\n", i, segment.URI)
 					storeIntoGridFS(recordingInfo, segment.URI)
+					// remove segment file
+					//_ = exec.Command("rm", "-rf", segment.URI).Start()
 				}
 			}
 
@@ -142,7 +141,7 @@ func watchM3u8File(ctx context.Context, recordingInfo *RecordingInfo) {
 
 func storeIntoGridFS(recordingInfo *RecordingInfo, segmentUri string) {
 	log.Printf("Storing segment %s into GridFS\n", segmentUri)
-	segmentPath := fmt.Sprintf("temp/%s/%s", recordingInfo.Id, segmentUri)
+	segmentPath := segmentUri
 
 	fs, err := gridfs.NewBucket(
 		db,
